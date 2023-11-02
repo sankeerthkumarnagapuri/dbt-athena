@@ -3,10 +3,8 @@ import os
 import posixpath as path
 import re
 import tempfile
-from dataclasses import dataclass
 from itertools import chain
 from textwrap import dedent
-from threading import Lock
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 from urllib.parse import urlparse
 from uuid import uuid4
@@ -23,28 +21,24 @@ from mypy_boto3_glue.type_defs import (
 )
 from pyathena.error import OperationalError
 
-from dbt.adapters.athena import AthenaConnectionManager
-from dbt.adapters.athena.column import AthenaColumn
-from dbt.adapters.athena.config import get_boto3_config
+from dbt.adapters.athena.aws.config import get_boto3_config
+from dbt.adapters.athena.aws.glue import (
+    GLUE_TABLE_TYPE_TO_RELATION_MAPPING,
+    get_table_type,
+)
+from dbt.adapters.athena.aws.lakeformation import LfGrantsConfig
+from dbt.adapters.athena.aws.s3 import S3DataNaming
 from dbt.adapters.athena.constants import LOGGER
+from dbt.adapters.athena.dbt.column import AthenaColumn
+from dbt.adapters.athena.dbt.relation import (
+    AthenaRelation,
+    AthenaSchemaSearchMap,
+    TableType,
+)
 from dbt.adapters.athena.exceptions import (
     S3LocationException,
     SnapshotMigrationRequired,
 )
-from dbt.adapters.athena.lakeformation import (
-    LfGrantsConfig,
-    LfPermissions,
-    LfTagsConfig,
-    LfTagsManager,
-)
-from dbt.adapters.athena.relation import (
-    RELATION_TYPE_MAP,
-    AthenaRelation,
-    AthenaSchemaSearchMap,
-    TableType,
-    get_table_type,
-)
-from dbt.adapters.athena.s3 import S3DataNaming
 from dbt.adapters.athena.utils import (
     AthenaCatalogType,
     clean_sql_comment,
@@ -52,122 +46,15 @@ from dbt.adapters.athena.utils import (
     get_catalog_type,
     get_chunks,
 )
-from dbt.adapters.base import ConstraintSupport, available
-from dbt.adapters.base.impl import AdapterConfig
+from dbt.adapters.base import available
 from dbt.adapters.base.relation import BaseRelation, InformationSchema
 from dbt.adapters.sql import SQLAdapter
 from dbt.contracts.graph.manifest import Manifest
-from dbt.contracts.graph.nodes import CompiledNode, ConstraintType
+from dbt.contracts.graph.nodes import CompiledNode
 from dbt.exceptions import DbtRuntimeError
-
-boto3_client_lock = Lock()
-
-
-@dataclass
-class AthenaConfig(AdapterConfig):
-    """
-    Database and relation-level configs.
-
-    Args:
-        work_group: Identifier of Athena workgroup.
-        s3_staging_dir: S3 location to store Athena query results and metadata.
-        external_location: If set, the full S3 path in which the table will be saved.
-        partitioned_by: An array list of columns by which the table will be partitioned.
-        bucketed_by: An array list of columns to bucket data, ignored if using Iceberg.
-        bucket_count: The number of buckets for bucketing your data, ignored if using Iceberg.
-        table_type: The type of table, supports hive or iceberg.
-        ha: If the table should be built using the high-availability method.
-        format: The data format for the table. Supports ORC, PARQUET, AVRO, JSON, TEXTFILE.
-        write_compression: The compression type to use for any storage format
-            that allows compression to be specified.
-        field_delimiter: Custom field delimiter, for when format is set to TEXTFILE.
-        table_properties : Table properties to add to the table, valid for Iceberg only.
-        native_drop:  Relation drop operations will be performed with SQL, not direct Glue API calls.
-        seed_by_insert: default behaviour uploads seed data to S3.
-        lf_tags_config: AWS lakeformation tags to associate with the table and columns.
-        seed_s3_upload_args: Dictionary containing boto3 ExtraArgs when uploading to S3.
-        partitions_limit: Maximum numbers of partitions when batching.
-    """
-
-    work_group: Optional[str] = None
-    s3_staging_dir: Optional[str] = None
-    external_location: Optional[str] = None
-    partitioned_by: Optional[str] = None
-    bucketed_by: Optional[str] = None
-    bucket_count: Optional[str] = None
-    table_type: str = "hive"
-    ha: bool = False
-    format: str = "parquet"
-    write_compression: Optional[str] = None
-    field_delimiter: Optional[str] = None
-    table_properties: Optional[str] = None
-    native_drop: Optional[str] = None
-    seed_by_insert: bool = False
-    lf_tags_config: Optional[Dict[str, Any]] = None
-    seed_s3_upload_args: Optional[Dict[str, Any]] = None
-    partitions_limit: Optional[int] = None
 
 
 class AthenaAdapter(SQLAdapter):
-    BATCH_CREATE_PARTITION_API_LIMIT = 100
-    BATCH_DELETE_PARTITION_API_LIMIT = 25
-
-    ConnectionManager = AthenaConnectionManager
-    Relation = AthenaRelation
-    AdapterSpecificConfigs = AthenaConfig
-
-    # There is no such concept as constraints in Athena
-    CONSTRAINT_SUPPORT = {
-        ConstraintType.check: ConstraintSupport.NOT_SUPPORTED,
-        ConstraintType.not_null: ConstraintSupport.NOT_SUPPORTED,
-        ConstraintType.unique: ConstraintSupport.NOT_SUPPORTED,
-        ConstraintType.primary_key: ConstraintSupport.NOT_SUPPORTED,
-        ConstraintType.foreign_key: ConstraintSupport.NOT_SUPPORTED,
-    }
-
-    @classmethod
-    def date_function(cls) -> str:
-        return "now()"
-
-    @classmethod
-    def convert_text_type(cls, agate_table: agate.Table, col_idx: int) -> str:
-        return "string"
-
-    @classmethod
-    def convert_number_type(cls, agate_table: agate.Table, col_idx: int) -> str:
-        decimals = agate_table.aggregate(agate.MaxPrecision(col_idx))
-        return "double" if decimals else "integer"
-
-    @classmethod
-    def convert_datetime_type(cls, agate_table: agate.Table, col_idx: int) -> str:
-        return "timestamp"
-
-    @available
-    def add_lf_tags_to_database(self, relation: AthenaRelation) -> None:
-        conn = self.connections.get_thread_connection()
-        client = conn.handle
-        if lf_tags := conn.credentials.lf_tags_database:
-            config = LfTagsConfig(enabled=True, tags=lf_tags)
-            with boto3_client_lock:
-                lf_client = client.session.client("lakeformation", client.region_name, config=get_boto3_config())
-            manager = LfTagsManager(lf_client, relation, config)
-            manager.process_lf_tags_database()
-        else:
-            LOGGER.debug(f"Lakeformation is disabled for {relation}")
-
-    @available
-    def add_lf_tags(self, relation: AthenaRelation, lf_tags_config: Dict[str, Any]) -> None:
-        config = LfTagsConfig(**lf_tags_config)
-        if config.enabled:
-            conn = self.connections.get_thread_connection()
-            client = conn.handle
-            with boto3_client_lock:
-                lf_client = client.session.client("lakeformation", client.region_name, config=get_boto3_config())
-            manager = LfTagsManager(lf_client, relation, config)
-            manager.process_lf_tags()
-            return
-        LOGGER.debug(f"Lakeformation is disabled for {relation}")
-
     @available
     def apply_lf_grants(self, relation: AthenaRelation, lf_grants_config: Dict[str, Any]) -> None:
         lf_config = LfGrantsConfig(**lf_grants_config)
@@ -473,7 +360,7 @@ class AthenaAdapter(SQLAdapter):
             "table_database": database,
             "table_schema": table["DatabaseName"],
             "table_name": table["Name"],
-            "table_type": RELATION_TYPE_MAP[table.get("TableType", "EXTERNAL_TABLE")].value,
+            "table_type": GLUE_TABLE_TYPE_TO_RELATION_MAPPING[table.get("TableType", "EXTERNAL_TABLE")].value,
             "table_comment": table.get("Parameters", {}).get("comment", table.get("Description", "")),
         }
         return [
@@ -496,7 +383,7 @@ class AthenaAdapter(SQLAdapter):
             "table_database": database,
             "table_schema": schema,
             "table_name": table["Name"],
-            "table_type": RELATION_TYPE_MAP[table.get("TableType", "EXTERNAL_TABLE")].value,
+            "table_type": GLUE_TABLE_TYPE_TO_RELATION_MAPPING[table.get("TableType", "EXTERNAL_TABLE")].value,
             "table_comment": table.get("Parameters", {}).get("comment", ""),
         }
         return [

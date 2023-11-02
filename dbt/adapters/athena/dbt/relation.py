@@ -2,9 +2,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Dict, Optional, Set
 
-from mypy_boto3_glue.type_defs import TableTypeDef
-
-from dbt.adapters.athena.constants import LOGGER
 from dbt.adapters.base.relation import BaseRelation, InformationSchema, Policy
 
 
@@ -75,31 +72,3 @@ class AthenaSchemaSearchMap(Dict[InformationSchema, Dict[str, Set[Optional[str]]
             if schema not in self[key]:
                 self[key][schema] = set()
             self[key][schema].add(relation_name)
-
-
-RELATION_TYPE_MAP = {
-    "EXTERNAL_TABLE": TableType.TABLE,
-    "EXTERNAL": TableType.TABLE,  # type returned by federated query tables
-    "MANAGED_TABLE": TableType.TABLE,
-    "VIRTUAL_VIEW": TableType.VIEW,
-    "table": TableType.TABLE,
-    "view": TableType.VIEW,
-    "cte": TableType.CTE,
-    "materializedview": TableType.MATERIALIZED_VIEW,
-}
-
-
-def get_table_type(table: TableTypeDef) -> TableType:
-    _type = RELATION_TYPE_MAP.get(table.get("TableType"))
-    _specific_type = table.get("Parameters", {}).get("table_type", "")
-
-    if _specific_type.lower() == "iceberg":
-        _type = TableType.ICEBERG
-
-    if _type is None:
-        raise ValueError("Table type cannot be None")
-
-    LOGGER.debug(f"table_name : {table.get('Name')}")
-    LOGGER.debug(f"table type : {_type}")
-
-    return _type
