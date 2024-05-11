@@ -45,7 +45,7 @@ from dbt.adapters.athena.lakeformation import (
     LfTagsConfig,
     LfTagsManager,
 )
-from dbt.adapters.athena.python_submissions import AthenaPythonJobHelper
+from dbt.adapters.athena.python_submissions import AthenaPythonJobHelper, EmrServerlessJobHelper, LambdaJobHelper
 from dbt.adapters.athena.relation import (
     RELATION_TYPE_MAP,
     AthenaRelation,
@@ -312,8 +312,8 @@ class AthenaAdapter(SQLAdapter):
             S3DataNaming.SCHEMA_TABLE: path.join(table_prefix, schema_name, s3_path_table_part),
             S3DataNaming.SCHEMA_TABLE_UNIQUE: path.join(table_prefix, schema_name, s3_path_table_part, str(uuid4())),
         }
-
-        return mapping[self._s3_data_naming(s3_data_naming)]
+        loc: str = mapping[self._s3_data_naming(s3_data_naming)]
+        return loc.rstrip("/")
 
     @available
     def get_glue_table(self, relation: AthenaRelation) -> Optional[GetTableResponseTypeDef]:
@@ -1059,7 +1059,11 @@ class AthenaAdapter(SQLAdapter):
 
     @property
     def python_submission_helpers(self) -> Dict[str, Type[PythonJobHelper]]:
-        return {"athena_helper": AthenaPythonJobHelper}
+        return {
+            "athena_helper": AthenaPythonJobHelper,
+            "emr_serverless": EmrServerlessJobHelper,
+            "lambda": LambdaJobHelper,
+        }
 
     @available
     def list_schemas(self, database: str) -> List[str]:
