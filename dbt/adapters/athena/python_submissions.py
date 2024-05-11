@@ -1,14 +1,23 @@
 import time
+import json
 from functools import cached_property
 from typing import Any, Dict
 from io import StringIO
 
 import botocore
 
-from dbt.adapters.athena.config import AthenaSparkSessionConfig, EmrServerlessSparkSessionConfig
+from dbt.adapters.athena.config import (
+    AthenaSparkSessionConfig,
+    EmrServerlessSparkSessionConfig,
+    LambdaSparkSessionConfig,
+)
 from dbt.adapters.athena.connections import AthenaCredentials
 from dbt.adapters.athena.constants import LOGGER
-from dbt.adapters.athena.session import AthenaSparkSessionManager, EmrServerlessSparkSessionManager
+from dbt.adapters.athena.session import (
+    AthenaSparkSessionManager,
+    EmrServerlessSparkSessionManager,
+    LambdaSparkSessionManager,
+)
 from dbt.adapters.base import PythonJobHelper
 from dbt.events.functions import get_invocation_id
 from dbt.exceptions import DbtRuntimeError
@@ -340,10 +349,10 @@ class EmrServerlessJobHelper(PythonJobHelper):
     @cached_property
     def s3_bucket(self) -> str:
         """
-        Get the emr application.
+        Get the staging s3 bucket.
 
         Returns:
-            str: The emr application.
+            str: The staging s3 bucket.
         """
         return self.config.get_s3_uri().split("/")[2]
 
@@ -610,3 +619,197 @@ error message:          {e}
             "stdout_s3_uri": f"s3://{self.s3_bucket}/{self.s3_log_prefix}/applications/{self.application_id}/jobs/{job_run_id}/SPARK_DRIVER/stdout.gz",
             "stderr_s3_uri": f"s3://{self.s3_bucket}/{self.s3_log_prefix}/applications/{self.application_id}/jobs/{job_run_id}/SPARK_DRIVER/stderr.gz",
         }
+
+
+class LambdaJobHelper(PythonJobHelper):
+    """
+    An implementation of running a PySpark job on lambda function.
+    `run_spark_job` is a synchronous call and waits until the job is in completed state.
+    """
+
+    def __init__(self, parsed_model: Dict[Any, Any], credentials: AthenaCredentials) -> None:
+        """
+        Initialize spark config and connection.
+
+        Args:
+            parsed_model (Dict[Any, Any]): The parsed python model.
+            credentials (AthenaCredentials): Credentials for Athena connection.
+        """
+        self.relation_name = parsed_model.get("relation_name", "NA")
+        self.config = LambdaSparkSessionConfig(
+            parsed_model.get("config", {}),
+            retry_attempts=credentials.num_retries,
+            s3_staging_dir=credentials.s3_staging_dir,
+            lambda_function_name=credentials.lambda_function_name,
+        )
+        self.spark_connection = LambdaSparkSessionManager(credentials)
+
+    @cached_property
+    def timeout(self) -> int:
+        """
+        Get the timeout value.
+
+        Returns:
+            int: The timeout value in seconds.
+        """
+        return int(self.config.set_timeout())
+
+    @cached_property
+    def invocation_id(self) -> str:
+        """
+        Get the dbt invocation unique id
+
+        Returns:
+            str: dbt invocation unique id
+        """
+        return get_invocation_id()
+
+    @cached_property
+    def lambda_client(self) -> Any:
+        """
+        Get the lambda client.
+
+        Returns:
+            Any: The lambda client object.
+        """
+        return self.spark_connection.lambda_client
+
+    @cached_property
+    def s3_client(self) -> Any:
+        """
+        Get the s3 client.
+
+        Returns:
+            Any: The s3 client object.
+        """
+        return self.spark_connection.s3_client
+
+    @cached_property
+    def s3_bucket(self) -> str:
+        """
+        Get the staging s3 bucket.
+
+        Returns:
+            str: The staging s3 bucket.
+        """
+        return self.config.get_s3_uri().split("/")[2]
+
+    @cached_property
+    def spark_properties(self) -> Dict[str, str]:
+        """
+        Get the spark properties.
+
+        Returns:
+            Dict[str, str]: A dictionary containing the spark properties.
+        """
+        return self.config.get_spark_properties()
+
+    @cached_property
+    def lambda_function_name(self) -> dict:
+        """
+        Get the lambda function name based on config and credentials.
+        Model configuration value is favored over credential configuration.
+
+        Returns:
+            dict: The lambda function name
+        """
+        return self.config.get_lambda_function_name()
+
+    def __str__(self):
+        return f"Lambda function: {self.lambda_function_name}"
+
+    def save_compiled_code(self, compiled_code: str) -> str:
+        """
+        Save the compiled code to the configured staging s3 bucket.
+
+        Returns:
+            str: The s3 uri path
+        """
+        LOGGER.debug(f"Uploading compiled script to {self.s3_bucket}")
+        # Create a file-like object from the Python script content
+        compiled_code = compiled_code.replace("s3://", "s3a://").replace("S3://", "s3a://")
+        script_file = StringIO(compiled_code)
+        table_name = str(self.relation_name).replace(" ", "_").replace('"', "").replace(".", "_")
+        s3_key = f"code/{self.invocation_id}/{table_name}.py"
+        try:
+            # Upload the Python script content as a file
+            self.s3_client.put_object(Body=script_file.getvalue(), Bucket=self.s3_bucket, Key=s3_key)
+            LOGGER.debug(f"Python compiled script uploaded to s3://{self.s3_bucket}/{s3_key}")
+            return f"s3://{self.s3_bucket}/{s3_key}"
+        except Exception as e:
+            raise DbtRuntimeError(f"Python compiled script upload to s3://{self.s3_bucket}/{s3_key} failed: {e}")
+
+    def invoke_lambda(self, function_name, event_data):
+        """Invoke an AWS Lambda function with event data and return the response."""
+        try:
+            json_payload = json.dumps(event_data)
+            response = self.lambda_client.invoke(
+                FunctionName=function_name, Payload=json_payload, InvocationType="RequestResponse"
+            )
+
+            with response["Payload"] as stream:
+                payload = json.loads(stream.read().decode("utf-8"))
+
+            status_code = response.get("StatusCode", 0)
+            lambda_status_code = payload.get("status_code", 0)
+            # Determine success from the status codes
+            success = status_code == 200 and lambda_status_code == 200
+            return success, payload
+
+        except botocore.exceptions.ClientError as e:
+            raise DbtRuntimeError(f"Client error: {e}")
+        except Exception as e:
+            raise DbtRuntimeError(f"Unexpected error: {e}")
+
+    def submit(self, compiled_code: str) -> Any:
+        """
+        Submit a spark job on lambda when the compiled code script is not blank and the application is started.
+
+        This function submits a spark job to lambda for execution using the provided compiled code.
+        This saves compiled code into s3 bucket and uses the s3 URI to execute the code.
+        The function waits until the job execution is completed, and retrieves the result.
+        If the execution is successful and completed, the result is returned. Otherwise, a DbtRuntimeError
+        is raised with the execution status.
+
+
+        Args:
+            compiled_code (str): The compiled code to submit for execution.
+
+        Returns:
+            dict: If the execution is successful and completed, returns
+            {
+            "dbt_invocation_id": str,
+            "dbt_model": str,
+            "lambda_function_name": str,
+            "script_location": str,
+            "log_group": str,
+            "log_stream": str,
+            }
+
+        Raises:
+            DbtRuntimeError: If the execution ends in a state other than "COMPLETED".
+
+        """
+        if compiled_code.strip():
+            script_location = self.save_compiled_code(compiled_code)
+            event_data = {
+                "SCRIPT_PATH": script_location,
+                "SPARK_PROPERTIES": self.spark_properties,
+                "TIMEOUT": self.timeout,
+            }
+
+            success, response_payload = self.invoke_lambda(self.lambda_function_name, event_data)
+            run_detail = {
+                "dbt_invocation_id": self.invocation_id,
+                "dbt_model": self.relation_name,
+                "lambda_function_name": self.lambda_function_name,
+                "script_location": script_location,
+                **response_payload["logs"],
+            }
+            if not success:
+                raise DbtRuntimeError(f"Error in Lambda execution. {run_detail}")
+            else:
+                LOGGER.debug(f"Lambda run complete for model: {self.relation_name}")
+                return run_detail
+        else:
+            return {"ignore": "empty compiled script"}

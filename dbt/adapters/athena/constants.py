@@ -64,4 +64,39 @@ EMR_SERVERLESS_SPARK_PROPERTIES = {
     },
 }
 
+
+LAMBDA_SPARK_PROPERTIES = {
+    "default": {
+        "spark.executor.instances": "1",
+        "spark.executor.cores": "1",
+        "spark.executor.memory": "1g",
+        "spark.driver.cores": "1",
+        "spark.driver.memory": "1g",
+        "spark.hadoop.hive.metastore.client.factory.class": "com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory",
+        "spark.hadoop.fs.s3a.aws.credentials.provider": "org.apache.hadoop.fs.s3a.TemporaryAWSCredentialsProvider",
+        "spark.driver.bindAddress": "127.0.0.1",
+    },
+    "iceberg": {
+        # "spark.jars.packages": "org.apache.iceberg",
+        "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        "spark.sql.catalog.AwsDataCatalog": "org.apache.iceberg.spark.SparkCatalog",
+        "spark.sql.catalog.AwsDataCatalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
+        "spark.sql.defaultCatalog": "AwsDataCatalog",
+        },
+    "hudi": {
+        "hoodie.meta.sync.client.tool.class", "org.apache.hudi.aws.sync.AwsGlueCatalogSyncTool",
+        "spark.serializer", "org.apache.spark.serializer.KryoSerializer",
+        "spark.sql.hive.convertMetastoreParquet", "false",
+        },
+    "delta_lake": {
+        # "spark.jars.packages", "io.delta:delta-core_2.12-2.2.0.jar",
+        "spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension",
+        "spark.sql.catalog.spark_catalog", "org.apache.spark.sql.delta.catalog.DeltaCatalog",
+        "spark.serializer", "org.apache.spark.serializer.KryoSerializer",
+        "spark.sql.hive.convertMetastoreParquet", "false",
+        },
+    "spark_encryption": {
+        **DEFAULT_SPARK_PROPERTIES["spark_encryption"]
+    },
+}
 LOGGER = AdapterLogger(__name__)

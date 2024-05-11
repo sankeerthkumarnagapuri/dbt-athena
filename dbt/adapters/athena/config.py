@@ -13,6 +13,7 @@ from dbt.adapters.athena.constants import (
     DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
     DEFAULT_SPARK_PROPERTIES,
     EMR_SERVERLESS_SPARK_PROPERTIES,
+    LAMBDA_SPARK_PROPERTIES,
     LOGGER,
 )
 
@@ -278,5 +279,91 @@ class EmrServerlessSparkSessionConfig(SparkSessionConfig):
                 jar_updated_list = list(set([item.strip() for item in jar_list + def_jar_list if item.strip()]))
                 final_jars = ", ".join(jar_updated_list)
                 provided_spark_properties["spark.jars"] = final_jars
+            default_spark_properties.update(provided_spark_properties)
+        return default_spark_properties
+
+
+class LambdaSparkSessionConfig(SparkSessionConfig):
+    """
+    A helper class to manage Lambda Spark Session Configuration.
+    """
+
+    def get_s3_uri(self) -> str:
+        """
+        Get the s3_staging_dir bucket for the configuration.
+
+        Returns:
+            Any: The s3_staging_dir bucket value.
+
+        Raises:
+            KeyError: If the s3_staging_dir value is not found in either `self.config`
+                or `self.session_kwargs`.
+        """
+        try:
+            return self.config["s3_staging_dir"]
+        except KeyError:
+            try:
+                return self.session_kwargs["s3_staging_dir"]
+            except KeyError:
+                raise ValueError("s3_staging_dir is required configuration")
+
+    def get_lambda_function_name(self) -> str:
+        """
+        Get the lambda_function_name for the configuration.
+
+        Returns:
+            Any: The lambda_function_name value.
+
+        Raises:
+            KeyError: If the emr_job_execution_role_arn value is not found in either `self.config`
+                or `self.session_kwargs`.
+        """
+        try:
+            return self.config["lambda_function_name"]
+        except KeyError:
+            try:
+                return self.session_kwargs["lambda_function_name"]
+            except KeyError:
+                raise ValueError("lambda_function_name is required configuration for lambda submission method")
+
+    def get_spark_properties(self) -> Dict[str, str]:
+        """
+        Gets the default spark properties after updated with the provided configuration from parsed model
+
+        Returns:
+            Dict[str, str]: Spark properties
+        """
+        table_type = self.config.get("table_type", "hive")
+        spark_encryption = self.config.get("spark_encryption", False)
+        default_spark_properties: Dict[str, str] = dict(
+            **LAMBDA_SPARK_PROPERTIES.get("default"),
+            **(
+                LAMBDA_SPARK_PROPERTIES.get(table_type)
+                if table_type.lower() in ["iceberg", "hudi", "delta_lake"]
+                else {}
+            ),
+            **LAMBDA_SPARK_PROPERTIES.get("spark_encryption") if spark_encryption else {},
+        )
+
+        provided_spark_properties = self.config.get("spark_properties", None)
+        provided_spark_properties = self.try_parse_json(provided_spark_properties)
+
+        if provided_spark_properties:
+            spark_jars = provided_spark_properties.get("spark.jars", None)
+            if spark_jars:
+                jar_list = spark_jars.split(",")
+                def_spark_jars = default_spark_properties.get("spark.jars", "")
+                def_jar_list = def_spark_jars.split(",")
+                jar_updated_list = list(set([item.strip() for item in jar_list + def_jar_list if item.strip()]))
+                final_jars = ", ".join(jar_updated_list)
+                provided_spark_properties["spark.jars"] = final_jars
+            spark_jar_pckgs = provided_spark_properties.get("spark.jars.packages", None)
+            if spark_jar_pckgs:
+                jar_pckgs_list = spark_jar_pckgs.split(",")
+                def_spark_jar_pckgs = default_spark_properties.get("spark.jars.packages", "")
+                def_jar_pckgs_list = def_spark_jar_pckgs.split(",")
+                jar_pckgs_updated_list = list(set([item.strip() for item in jar_pckgs_list + def_jar_pckgs_list if item.strip()]))
+                final_jar_pckgs = ", ".join(jar_pckgs_updated_list)
+                provided_spark_properties["spark.jars.packages"] = final_jar_pckgs
             default_spark_properties.update(provided_spark_properties)
         return default_spark_properties

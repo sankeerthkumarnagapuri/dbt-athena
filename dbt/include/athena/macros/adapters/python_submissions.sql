@@ -11,8 +11,21 @@
     {% set field_delimiter = optional_args.get("field_delimiter") %}
     {% set spark_ctas = optional_args.get("spark_ctas", "") %}
     {% set submission_method = optional_args.get("submission_method", "") %}
+    {% set table_type = optional_args.get("table_type", "") %}
+    {% set spark_properties = optional_args.get("spark_properties", "") %}
 
 import pyspark
+
+{% if submission_method == "lambda" %}
+spark = pyspark.sql.SparkSession.builder \
+    .appName("dbt_{{ target_relation.schema}}_{{ target_relation.identifier }}") \
+    .master("local[*]") \
+    {%- if table_type == "iceberg" %}
+    .config("spark.sql.catalog.AwsDataCatalog.warehouse", "{{ location | replace('s3://', 's3a://') }}") \
+    {%- endif %}
+    .enableHiveSupport().getOrCreate()
+{% endif %}
+
 {% if submission_method == "emr_serverless" %}
 spark = pyspark.sql.SparkSession.builder.appName("dbt_{{ target_relation.schema}}_{{ target_relation.identifier }}").enableHiveSupport().getOrCreate()
 {% endif %}
