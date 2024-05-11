@@ -20,7 +20,7 @@ from dbt.adapters.athena.session import (
     LambdaSparkSessionManager,
 )
 from dbt.adapters.base import PythonJobHelper
-from dbt.events.functions import get_invocation_id
+from dbt_common.invocation import get_invocation_id
 
 SUBMISSION_LANGUAGE = "python"
 
