@@ -311,3 +311,53 @@ class EmrServerlessSparkSessionManager:
         return get_boto3_session_from_credentials(self.credentials).client(
             "s3", config=get_boto3_config(num_retries=self.credentials.effective_num_retries)
         )
+
+
+class LambdaSparkSessionManager:
+    """
+    A helper class to manage Lambda Spark Sessions.
+    """
+
+    def __init__(
+        self,
+        credentials: Any,
+    ) -> None:
+        """
+        Initialize the LambdaSparkSessionManager instance.
+
+        Args:
+            credentials (Any): The credentials to be used.
+        """
+        self.credentials = credentials
+
+    @cached_property
+    def lambda_client(self) -> Any:
+        """
+        Get the Lambda client.
+
+        This function returns an Lambda client object that can be used to interact with the aws Lambda service.
+        The client is created using the region name and profile name provided during object instantiation.
+
+        Returns:
+            Any: The client object.
+
+        """
+        return get_boto3_session_from_credentials(self.credentials).client(
+            "lambda", config=get_boto3_config(num_retries=self.credentials.effective_num_retries)
+        )
+
+    @cached_property
+    def s3_client(self) -> Any:
+        """
+        Get the AWS s3 client.
+
+        This function returns an AWS s3 client object that can be used to interact with the s3 service.
+        The client is created using the region name and profile name provided during object instantiation.
+
+        Returns:
+            Any: The s3 client object.
+
+        """
+        return get_boto3_session_from_credentials(self.credentials).client(
+            "s3", config=get_boto3_config(num_retries=self.credentials.effective_num_retries)
+        )
