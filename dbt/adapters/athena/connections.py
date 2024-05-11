@@ -1,4 +1,3 @@
-import hashlib
 import json
 import re
 import time
@@ -10,6 +9,8 @@ from decimal import Decimal
 from typing import Any, ContextManager, Dict, List, Optional, Tuple
 
 import tenacity
+from dbt_common.exceptions import ConnectionError, DbtRuntimeError
+from dbt_common.utils import md5
 from pyathena.connection import Connection as AthenaConnection
 from pyathena.cursor import Cursor
 from pyathena.error import OperationalError, ProgrammingError
@@ -30,11 +31,15 @@ from tenacity.wait import wait_exponential
 
 from dbt.adapters.athena.config import get_boto3_config
 from dbt.adapters.athena.constants import LOGGER
+from dbt.adapters.athena.query_headers import AthenaMacroQueryStringSetter
 from dbt.adapters.athena.session import get_boto3_session
-from dbt.adapters.base import Credentials
+from dbt.adapters.contracts.connection import (
+    AdapterResponse,
+    Connection,
+    ConnectionState,
+    Credentials,
+)
 from dbt.adapters.sql import SQLConnectionManager
-from dbt.contracts.connection import AdapterResponse, Connection, ConnectionState
-from dbt.exceptions import ConnectionError, DbtRuntimeError
 
 
 @dataclass
@@ -76,7 +81,7 @@ class AthenaCredentials(Credentials):
 
     @property
     def unique_field(self) -> str:
-        return f"athena-{hashlib.md5(self.s3_staging_dir.encode()).hexdigest()}"
+        return f"athena-{md5(self.s3_staging_dir)}"
 
     @property
     def effective_num_retries(self) -> int:
@@ -92,8 +97,6 @@ class AthenaCredentials(Credentials):
             "poll_interval",
             "aws_profile_name",
             "aws_access_key_id",
-            "aws_secret_access_key",
-            "aws_session_token",
             "endpoint_url",
             "s3_data_dir",
             "s3_data_naming",
@@ -208,6 +211,9 @@ class AthenaCursor(Cursor):
 
 class AthenaConnectionManager(SQLConnectionManager):
     TYPE = "athena"
+
+    def set_query_header(self, query_header_context: Dict[str, Any]) -> None:
+        self.query_header = AthenaMacroQueryStringSetter(self.profile, query_header_context)
 
     @classmethod
     def data_type_code_to_name(cls, type_code: str) -> str:

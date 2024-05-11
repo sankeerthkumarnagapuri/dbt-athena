@@ -28,20 +28,18 @@ def _get_plugin_version_dict() -> Dict[str, Any]:
 
 def _get_package_version() -> str:
     parts = _get_plugin_version_dict()
-    return f'{parts["major"]}.{parts["minor"]}.{parts["patch"]}'
+    version = "{major}.{minor}.{patch}".format(**parts)
+    if parts["prekind"] and parts["pre"]:
+        version += parts["prekind"] + parts["pre"]
+    return version
 
 
-dbt_version = "1.7"
-package_version = _get_package_version()
 description = "The athena adapter plugin for dbt (data build tool)"
-
-if not package_version.startswith(dbt_version):
-    raise ValueError(f"Invalid setup.py: package_version={package_version} must start with dbt_version={dbt_version}")
 
 
 setup(
     name=package_name,
-    version=package_version,
+    version=_get_package_version(),
     description=description,
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -52,12 +50,12 @@ setup(
     packages=find_namespace_packages(include=["dbt", "dbt.*"]),
     include_package_data=True,
     install_requires=[
-        # In order to control dbt-core version and package version
-        "boto3~=1.34",
-        "boto3-stubs[athena,glue,lakeformation,sts]~=1.34",
-        "dbt-core~=1.7.0",
-        "mmh3>=4.0.1,<4.2.0",
+        "dbt-common>=1.0.0b2,<2.0",
+        "dbt-adapters>=1.0.0b2,<2.0",
+        "boto3>=1.28",
+        "boto3-stubs[athena,glue,lakeformation,sts]>=1.28",
         "pyathena>=2.25,<4.0",
+        "mmh3>=4.0.1,<4.2.0",
         "pydantic>=1.10,<3.0",
         "tenacity~=8.2",
     ],
@@ -73,5 +71,5 @@ setup(
         "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
     ],
-    python_requires=">=3.8",
+    python_requires=">=3.8,<3.13",
 )

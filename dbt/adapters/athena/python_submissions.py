@@ -5,6 +5,7 @@ from typing import Any, Dict
 from io import StringIO
 
 import botocore
+from dbt_common.exceptions import DbtRuntimeError
 
 from dbt.adapters.athena.config import (
     AthenaSparkSessionConfig,
@@ -21,6 +22,7 @@ from dbt.adapters.athena.session import (
 from dbt.adapters.base import PythonJobHelper
 from dbt.events.functions import get_invocation_id
 from dbt.exceptions import DbtRuntimeError
+
 
 SUBMISSION_LANGUAGE = "python"
 

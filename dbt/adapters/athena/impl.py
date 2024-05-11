@@ -6,17 +6,21 @@ import struct
 import tempfile
 from dataclasses import dataclass
 from datetime import date, datetime
-from itertools import chain
+from functools import lru_cache
 from textwrap import dedent
 from threading import Lock
-from typing import Any, Dict, Iterator, List, Optional, Set, Tuple, Type
+from typing import Any, Dict, FrozenSet, Iterable, List, Optional, Set, Tuple, Type
 from urllib.parse import urlparse
 from uuid import uuid4
 
 import agate
 import mmh3
 from botocore.exceptions import ClientError
-from mypy_boto3_athena.type_defs import DataCatalogTypeDef
+from dbt_common.clients.agate_helper import table_from_rows
+from dbt_common.contracts.constraints import ConstraintType
+from dbt_common.exceptions import DbtRuntimeError
+from mypy_boto3_athena import AthenaClient
+from mypy_boto3_athena.type_defs import DataCatalogTypeDef, GetWorkGroupOutputTypeDef
 from mypy_boto3_glue.type_defs import (
     ColumnTypeDef,
     GetTableResponseTypeDef,
@@ -63,13 +67,9 @@ from dbt.adapters.athena.utils import (
 from dbt.adapters.base import ConstraintSupport, PythonJobHelper, available
 from dbt.adapters.base.impl import AdapterConfig
 from dbt.adapters.base.relation import BaseRelation, InformationSchema
+from dbt.adapters.contracts.connection import AdapterResponse
+from dbt.adapters.contracts.relation import RelationConfig
 from dbt.adapters.sql import SQLAdapter
-from dbt.clients.agate_helper import table_from_rows
-from dbt.config.runtime import RuntimeConfig
-from dbt.contracts.connection import AdapterResponse
-from dbt.contracts.graph.manifest import Manifest
-from dbt.contracts.graph.nodes import CompiledNode, ConstraintType
-from dbt.exceptions import DbtRuntimeError
 
 boto3_client_lock = Lock()
 
@@ -214,6 +214,13 @@ class AthenaAdapter(SQLAdapter):
             lf_permissions.process_filters(lf_config)
             lf_permissions.process_permissions(lf_config)
 
+    @lru_cache()
+    def _get_work_group(self, client: AthenaClient, work_group: str) -> GetWorkGroupOutputTypeDef:
+        """
+        helper function to cache the result of the get_work_group to avoid APIs throttling
+        """
+        return client.get_work_group(WorkGroup=work_group)
+
     @available
     def is_work_group_output_location_enforced(self) -> bool:
         conn = self.connections.get_thread_connection()
@@ -228,7 +235,7 @@ class AthenaAdapter(SQLAdapter):
             )
 
         if creds.work_group:
-            work_group = athena_client.get_work_group(WorkGroup=creds.work_group)
+            work_group = self._get_work_group(athena_client, creds.work_group)
             output_location = (
                 work_group.get("WorkGroup", {})
                 .get("Configuration", {})
@@ -398,6 +405,12 @@ class AthenaAdapter(SQLAdapter):
         partitions = partition_pg.build_full_result().get("Partitions")
         for partition in partitions:
             self.delete_from_s3(partition["StorageDescriptor"]["Location"])
+            glue_client.delete_partition(
+                CatalogId=catalog_id,
+                DatabaseName=relation.schema,
+                TableName=relation.identifier,
+                PartitionValues=partition["Values"],
+            )
 
     @available
     def clean_up_table(self, relation: AthenaRelation) -> None:
@@ -523,29 +536,6 @@ class AthenaAdapter(SQLAdapter):
         response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_prefix)
         return True if "Contents" in response else False
 
-    def _join_catalog_table_owners(self, table: agate.Table, manifest: Manifest) -> agate.Table:
-        owners = []
-        # Get the owner for each model from the manifest
-        for node in manifest.nodes.values():
-            if node.resource_type == "model":
-                owners.append(
-                    {
-                        "table_database": node.database,
-                        "table_schema": node.schema,
-                        "table_name": node.alias,
-                        "table_owner": node.config.meta.get("owner"),
-                    }
-                )
-        owners_table = agate.Table.from_object(owners)
-
-        # Join owners with the results from catalog
-        join_keys = ["table_database", "table_schema", "table_name"]
-        return table.join(
-            right_table=owners_table,
-            left_key=join_keys,
-            right_key=join_keys,
-        )
-
     def _get_one_table_for_catalog(self, table: TableTypeDef, database: str) -> List[Dict[str, Any]]:
         table_catalog = {
             "table_database": database,
@@ -593,13 +583,13 @@ class AthenaAdapter(SQLAdapter):
     def _get_one_catalog(
         self,
         information_schema: InformationSchema,
-        schemas: Dict[str, Optional[Set[str]]],
-        manifest: Manifest,
+        schemas: Set[str],
+        used_schemas: FrozenSet[Tuple[str, str]],
     ) -> agate.Table:
         """
         This function is invoked by Adapter.get_catalog for each schema.
         """
-        data_catalog = self._get_data_catalog(information_schema.path.database)
+        data_catalog = self._get_data_catalog(information_schema.database)
         data_catalog_type = get_catalog_type(data_catalog)
 
         conn = self.connections.get_thread_connection()
@@ -615,7 +605,7 @@ class AthenaAdapter(SQLAdapter):
 
             catalog = []
             paginator = glue_client.get_paginator("get_tables")
-            for schema, relations in schemas.items():
+            for schema in schemas:
                 kwargs = {
                     "DatabaseName": schema,
                     "MaxResults": 100,
@@ -628,8 +618,7 @@ class AthenaAdapter(SQLAdapter):
 
                 for page in paginator.paginate(**kwargs):
                     for table in page["TableList"]:
-                        if relations and table["Name"] in relations:
-                            catalog.extend(self._get_one_table_for_catalog(table, information_schema.path.database))
+                        catalog.extend(self._get_one_table_for_catalog(table, information_schema.database))
             table = agate.Table.from_object(catalog)
         else:
             with boto3_client_lock:
@@ -641,36 +630,28 @@ class AthenaAdapter(SQLAdapter):
 
             catalog = []
             paginator = athena_client.get_paginator("list_table_metadata")
-            for schema, relations in schemas.items():
+            for schema in schemas:
                 for page in paginator.paginate(
-                    CatalogName=information_schema.path.database,
+                    CatalogName=information_schema.database,
                     DatabaseName=schema,
                     MaxResults=50,  # Limit supported by this operation
                 ):
                     for table in page["TableMetadataList"]:
-                        if relations and table["Name"].lower() in relations:
-                            catalog.extend(
-                                self._get_one_table_for_non_glue_catalog(
-                                    table, schema, information_schema.path.database
-                                )
-                            )
+                        catalog.extend(
+                            self._get_one_table_for_non_glue_catalog(table, schema, information_schema.database)
+                        )
             table = agate.Table.from_object(catalog)
 
-        filtered_table = self._catalog_filter_table(table, manifest)
-        return self._join_catalog_table_owners(filtered_table, manifest)
+        return self._catalog_filter_table(table, used_schemas)
 
-    def _get_catalog_schemas(self, manifest: Manifest) -> AthenaSchemaSearchMap:
+    def _get_catalog_schemas(self, relation_configs: Iterable[RelationConfig]) -> AthenaSchemaSearchMap:
         """
         Get the schemas from the catalog.
         It's called by the `get_catalog` method.
         """
         info_schema_name_map = AthenaSchemaSearchMap()
-        nodes: Iterator[CompiledNode] = chain(
-            [node for node in manifest.nodes.values() if (node.is_relational and not node.is_ephemeral_model)],
-            manifest.sources.values(),
-        )
-        for node in nodes:
-            relation = self.Relation.create_from(self.config, node)
+        for relation_config in relation_configs:
+            relation = self.Relation.create_from(quoting=self.config, relation_config=relation_config)
             info_schema_name_map.add(relation)
         return info_schema_name_map
 
@@ -713,56 +694,55 @@ class AthenaAdapter(SQLAdapter):
                 region_name=client.region_name,
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
-        paginator = glue_client.get_paginator("get_tables")
 
         kwargs = {
             "DatabaseName": schema_relation.schema,
         }
-        # If the catalog is `awsdatacatalog` we don't need to pass CatalogId as boto3 infers it from the account Id.
         if catalog_id := get_catalog_id(data_catalog):
             kwargs["CatalogId"] = catalog_id
-        page_iterator = paginator.paginate(**kwargs)
-
-        relations = []
-        quote_policy = {"database": True, "schema": True, "identifier": True}
-
+        paginator = glue_client.get_paginator("get_tables")
         try:
-            for page in page_iterator:
-                tables = page["TableList"]
-                for table in tables:
-                    if "TableType" not in table:
-                        LOGGER.debug(f"Table '{table['Name']}' has no TableType attribute - Ignoring")
-                        continue
-                    _type = table["TableType"]
-                    _detailed_table_type = table["Parameters"].get("table_type", "")
-                    if _type == "VIRTUAL_VIEW":
-                        _type = self.Relation.View
-                    else:
-                        _type = self.Relation.Table
-
-                    relations.append(
-                        self.Relation.create(
-                            schema=schema_relation.schema,
-                            database=schema_relation.database,
-                            identifier=table["Name"],
-                            quote_policy=quote_policy,
-                            type=_type,
-                            detailed_table_type=_detailed_table_type,
-                        )
-                    )
+            tables = paginator.paginate(**kwargs).build_full_result().get("TableList")
         except ClientError as e:
             # don't error out when schema doesn't exist
             # this allows dbt to create and manage schemas/databases
-            LOGGER.debug(f"Schema '{schema_relation.schema}' does not exist - Ignoring: {e}")
+            if e.response["Error"]["Code"] == "EntityNotFoundException":
+                LOGGER.debug(f"Schema '{schema_relation.schema}' does not exist - Ignoring: {e}")
+                return []
+            else:
+                raise e
 
+        relations: List[BaseRelation] = []
+        quote_policy = {"database": True, "schema": True, "identifier": True}
+        for table in tables:
+            if "TableType" not in table:
+                LOGGER.info(f"Table '{table['Name']}' has no TableType attribute - Ignoring")
+                continue
+            _type = table["TableType"]
+            _detailed_table_type = table.get("Parameters", {}).get("table_type", "")
+            if _type == "VIRTUAL_VIEW":
+                _type = self.Relation.View
+            else:
+                _type = self.Relation.Table
+
+            relations.append(
+                self.Relation.create(
+                    schema=schema_relation.schema,
+                    database=schema_relation.database,
+                    identifier=table["Name"],
+                    quote_policy=quote_policy,
+                    type=_type,
+                    detailed_table_type=_detailed_table_type,
+                )
+            )
         return relations
 
     def _get_one_catalog_by_relations(
         self,
         information_schema: InformationSchema,
-        relations: List[BaseRelation],
-        manifest: Manifest,
-    ) -> agate.Table:
+        relations: List[AthenaRelation],
+        used_schemas: FrozenSet[Tuple[str, str]],
+    ) -> "agate.Table":
         """
         Overwrite of _get_one_catalog_by_relations for Athena, in order to use glue apis.
         This function is invoked by Adapter.get_catalog_by_relations.
@@ -775,12 +755,11 @@ class AthenaAdapter(SQLAdapter):
                 _table_definitions.extend(_table_definition)
         table = agate.Table.from_object(_table_definitions)
         # picked from _catalog_filter_table, force database + schema to be strings
-        table_casted = table_from_rows(
+        return table_from_rows(
             table.rows,
             table.column_names,
             text_only_columns=["table_database", "table_schema", "table_name"],
         )
-        return self._join_catalog_table_owners(table_casted, manifest)
 
     @available
     def swap_table(self, src_relation: AthenaRelation, target_relation: AthenaRelation) -> None:
@@ -977,6 +956,7 @@ class AthenaAdapter(SQLAdapter):
         # Prepare new version of Glue Table picking up significant fields
         table_input = self._get_table_input(table)
         table_parameters = table_input["Parameters"]
+
         # Update table description
         if persist_relation_docs:
             # Prepare dbt description
@@ -997,11 +977,9 @@ class AthenaAdapter(SQLAdapter):
             # Add some of dbt model config fields as table meta
             meta["unique_id"] = model.get("unique_id")
             meta["materialized"] = model.get("config", {}).get("materialized")
-            # Get dbt runtime config to be able to get dbt project metadata
-            runtime_config: RuntimeConfig = self.config
             # Add dbt project metadata to table meta
-            meta["dbt_project_name"] = runtime_config.project_name
-            meta["dbt_project_version"] = runtime_config.version
+            meta["dbt_project_name"] = self.config.project_name
+            meta["dbt_project_version"] = self.config.version
             # Prepare meta values for table properties and check if update is required
             for meta_key, meta_value_raw in meta.items():
                 if is_valid_table_parameter_key(meta_key):
@@ -1035,6 +1013,29 @@ class AthenaAdapter(SQLAdapter):
                         need_to_update_table = True
                     # Save column description from dbt
                     col_obj["Comment"] = clean_col_comment
+
+                    # Get dbt model column meta if available
+                    col_meta: Dict[str, Any] = model["columns"][col_name].get("meta", {})
+                    # Add empty Parameters dictionary if not present
+                    if col_meta and "Parameters" not in col_obj.keys():
+                        col_obj["Parameters"] = {}
+                    # Prepare meta values for column properties and check if update is required
+                    for meta_key, meta_value_raw in col_meta.items():
+                        if is_valid_table_parameter_key(meta_key):
+                            meta_value = stringify_table_parameter_value(meta_value_raw)
+                            if meta_value is not None:
+                                # Check if meta value is already attached to Glue column
+                                col_current_meta_value: Optional[str] = col_obj["Parameters"].get(meta_key)
+                                if col_current_meta_value is None or col_current_meta_value != meta_value:
+                                    need_to_update_table = True
+                                # Save Glue column parameter
+                                col_obj["Parameters"][meta_key] = meta_value
+                            else:
+                                LOGGER.warning(
+                                    f"Column meta value for key '{meta_key}' is not supported and will be ignored"
+                                )
+                        else:
+                            LOGGER.warning(f"Column meta key '{meta_key}' is not supported and will be ignored")
 
         # Update Glue Table only if table/column description is modified.
         # It prevents redundant schema version creating after incremental runs.
@@ -1108,10 +1109,15 @@ class AthenaAdapter(SQLAdapter):
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
 
+        get_table_kwargs = dict(
+            DatabaseName=relation.schema,
+            Name=relation.identifier,
+        )
+        if catalog_id:
+            get_table_kwargs["CatalogId"] = catalog_id
+
         try:
-            table = glue_client.get_table(CatalogId=catalog_id, DatabaseName=relation.schema, Name=relation.identifier)[
-                "Table"
-            ]
+            table = glue_client.get_table(**get_table_kwargs)["Table"]
         except ClientError as e:
             if e.response["Error"]["Code"] == "EntityNotFoundException":
                 LOGGER.debug("table not exist, catching the error")
