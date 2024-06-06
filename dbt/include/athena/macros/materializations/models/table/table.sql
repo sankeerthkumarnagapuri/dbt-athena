@@ -47,75 +47,51 @@
 
   {{ run_hooks(pre_hooks) }}
 
-  {%- if table_type == 'hive' -%}
+  {%- set build_py = "" -%}
+  {%- set post_handle_hive_clean = false -%}
+  {%- set post_handle_hive_classification = false -%}
+  {%- set post_handle_old_relation_bkp = false -%}
 
+  {%- if table_type == 'hive' -%}
     -- for ha tables that are not in full refresh mode and when the relation exists we use the swap behavior
     {%- if is_ha and not is_full_refresh_mode and old_relation is not none -%}
       -- drop the old_tmp_relation if it exists
       {%- if old_tmp_relation is not none -%}
         {%- do adapter.delete_from_glue_catalog(old_tmp_relation) -%}
       {%- endif -%}
-
       -- create tmp table
       {%- set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch) -%}
-      -- Execute python code that is available in query result object
-      {%- if language == 'python' -%}
-        {% call statement('create_table', language=language) %}
-          {{ query_result }}
-        {% endcall %}
-      {%- endif -%}
-      -- swap table
-      {%- set swap_table = adapter.swap_table(tmp_relation, target_relation) -%}
-
-      -- delete glue tmp table, do not use drop_relation, as it will remove data of the target table
-      {%- do adapter.delete_from_glue_catalog(tmp_relation) -%}
-
-      {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, True) %}
-
+      -- Set python code
+      {% set build_py = query_result -%}
+      {%- set post_handle_hive_clean = true -%}
     {%- else -%}
       -- Here we are in the case of non-ha tables or ha tables but in case of full refresh.
       {%- if old_relation is not none -%}
         {{ drop_relation(old_relation) }}
       {%- endif -%}
       {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch) -%}
-      -- Execute python code that is available in query result object
-      {%- if language == 'python' -%}
-        {% call statement('create_table', language=language) %}
-          {{ query_result }}
-        {% endcall %}
-      {%- endif -%}
+      -- Set python code
+      {% set build_py = query_result -%}
     {%- endif -%}
-
     {%- if language != 'python' -%}
-      {{ set_table_classification(target_relation) }}
+      {%- set post_handle_hive_classification = true -%}
     {%- endif -%}
   {%- else -%}
-
     {%- if old_relation is none -%}
       {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch) -%}
-      -- Execute python code that is available in query result object
-      {%- if language == 'python' -%}
-        {% call statement('create_table', language=language) %}
-          {{ query_result }}
-        {% endcall %}
-      {%- endif -%}
+      -- Set python code
+      {% set build_py = query_result -%}
     {%- else -%}
       {%- if old_relation.is_view -%}
-        {%- set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch) -%}
-        -- Execute python code that is available in query result object
-        {%- if language == 'python' -%}
-          {% call statement('create_table', language=language) %}
-            {{ query_result }}
-          {% endcall %}
-        {%- endif -%}
         {%- do drop_relation(old_relation) -%}
-        {%- do rename_relation(tmp_relation, target_relation) -%}
+        {%- set query_result = safe_create_table_as(False, target_relation, compiled_code, language, force_batch) -%}
+        -- Set python code
+        {% set build_py = query_result -%}
       {%- else -%}
         -- delete old tmp iceberg table if it exists
         {%- if old_tmp_relation is not none -%}
           {%- do drop_relation(old_tmp_relation) -%}
         {%- endif -%}
-
         {%- set old_relation_bkp = make_temp_relation(old_relation, '__bkp') -%}
         -- If we have this, it means that at least the first renaming occurred but there was an issue
         -- afterwards, therefore we are in weird state. The easiest and cleanest should be to remove
@@ -124,28 +100,40 @@
         {%- if old_bkp_relation is not none -%}
           {%- do drop_relation(old_bkp_relation) -%}
         {%- endif -%}
-
         {% set query_result = safe_create_table_as(False, tmp_relation, compiled_code, language, force_batch) %}
-        -- Execute python code that is available in query result object
-        {%- if language == 'python' -%}
-          {% call statement('create_table', language=language) %}
-            {{ query_result }}
-          {% endcall %}
-        {%- endif -%}
-        {{ rename_relation(old_relation, old_relation_bkp) }}
-        {{ rename_relation(tmp_relation, target_relation) }}
-
-        {{ drop_relation(old_relation_bkp) }}
+        -- Set python code
+        {% set build_py = query_result -%}
+        {%- set post_handle_old_relation_bkp = true -%}
       {%- endif -%}
     {%- endif -%}
-
   {%- endif -%}
 
-  {% call statement("main", language=language) %}
-    {%- if language=='sql' -%}
+  {%- call statement("main", language=language) -%}
+    {%- if language == 'sql' -%}
       SELECT '{{ query_result }}';
+    {%- else -%}
+      {{- build_py -}}
     {%- endif -%}
-  {% endcall %}
+  {%- endcall -%}
+
+  {% if post_handle_hive_clean %}
+    -- swap table
+    {%- set swap_table = adapter.swap_table(tmp_relation, target_relation) -%}
+    -- delete glue tmp table, do not use drop_relation, as it will remove data of the target table
+    {%- do adapter.delete_from_glue_catalog(tmp_relation) -%}
+    {% do adapter.expire_glue_table_versions(target_relation, versions_to_keep, True) %}
+  {% endif %}
+
+  {% if post_handle_hive_classification %}
+    {{ set_table_classification(target_relation) }}
+  {% endif %}
+
+  {% if post_handle_old_relation_bkp %}   
+    -- at this point old_relation_bkp must be set and available and below wouldnt fail
+    {{ rename_relation(old_relation, old_relation_bkp) }}
+    {{ rename_relation(tmp_relation, target_relation) }}
+    {{ drop_relation(old_relation_bkp) }}
+  {% endif %}
 
   {{ run_hooks(post_hooks) }}
 

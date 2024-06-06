@@ -39,3 +39,23 @@ pre-commit-all:  ## Check all files in working directory with pre-commit.
 
 help:  ## Show this help.
 	@egrep -h '\s##\s' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m  %-30s\033[0m %s\n", $$1, $$2}'
+
+ca-login:
+	aws codeartifact login --tool pip --repository mdata --domain mtx --domain-owner 955578949754 --region us-east-1
+
+ca-geturl:
+	aws codeartifact get-repository-endpoint --domain mtx --domain-owner 955578949754 --repository mdata --format pypi --region us-east-1
+
+ca-build:
+	# python -m pip install --upgrade build
+	python -m build
+
+ca-upload:
+	# python -m pip install --upgrade twine
+	$(eval AUTH_TOKEN=$(shell aws codeartifact get-authorization-token --domain mtx --domain-owner 955578949754 --region us-east-1 --query 'authorizationToken' --output text))
+	# @echo "Using authorization token: $(AUTH_TOKEN)"
+	twine upload --repository-url https://mtx-955578949754.d.codeartifact.us-east-1.amazonaws.com/pypi/mdata/ --verbose --username aws --password $(AUTH_TOKEN) dist/*
+
+ca-pip-extra:
+	export PIP_EXTRA_INDEX_URL=https://aws:$(aws codeartifact get-authorization-token --domain mtx --domain-owner 955578949754 --region us-east-1 --query authorizationToken --output text)@mtx-955578949754.d.codeartifact.us-east-1.amazonaws.com/pypi/mdata/simple/
+	

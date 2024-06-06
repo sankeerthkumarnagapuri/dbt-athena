@@ -9,6 +9,10 @@ DEFAULT_SPARK_EXECUTOR_DPU_SIZE = 1
 DEFAULT_CALCULATION_TIMEOUT = 43200  # seconds = 12 hours
 SESSION_IDLE_TIMEOUT_MIN = 10  # minutes
 
+ENFORCE_SPARK_PROPERTIES = {
+    "spark.sql.sources.partitionOverwriteMode": "dynamic",
+}
+
 DEFAULT_SPARK_PROPERTIES = {
     # https://docs.aws.amazon.com/athena/latest/ug/notebooks-spark-table-formats.html
     "iceberg": {
@@ -16,6 +20,7 @@ DEFAULT_SPARK_PROPERTIES = {
         "spark.sql.catalog.spark_catalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
         "spark.sql.catalog.spark_catalog.io-impl": "org.apache.iceberg.aws.s3.S3FileIO",
         "spark.sql.extensions": "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions",
+        "spark.sql.sources.partitionOverwriteMode": "dynamic",
     },
     "hudi": {
         "spark.sql.catalog.spark_catalog": "org.apache.spark.sql.hudi.catalog.HoodieCatalog",
@@ -82,6 +87,7 @@ LAMBDA_SPARK_PROPERTIES = {
         "spark.sql.catalog.AwsDataCatalog": "org.apache.iceberg.spark.SparkCatalog",
         "spark.sql.catalog.AwsDataCatalog.catalog-impl": "org.apache.iceberg.aws.glue.GlueCatalog",
         "spark.sql.defaultCatalog": "AwsDataCatalog",
+        "spark.sql.sources.partitionOverwriteMode": "dynamic",
         },
     "hudi": {
         "hoodie.meta.sync.client.tool.class", "org.apache.hudi.aws.sync.AwsGlueCatalogSyncTool",

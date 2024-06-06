@@ -17,18 +17,28 @@ package_name = "dbt-athena-community"
 def _get_plugin_version_dict() -> Dict[str, Any]:
     _version_path = os.path.join(this_directory, "dbt", "adapters", "athena", "__version__.py")
     _semver = r"""(?P<major>\d+)\.(?P<minor>\d+)\.(?P<patch>\d+)"""
-    _pre = r"""((?P<prekind>a|b|rc)(?P<pre>\d+))?"""
-    _version_pattern = rf"""version\s*=\s*["']{_semver}{_pre}["']"""
+    _pre = r"""([-\.]?(?P<prekind>a|b|rc|mdata)(?P<pre>\d*)?)?"""
+    _local = r"""(\+(?P<local>[a-zA-Z0-9]+))?"""
+    _version_pattern = rf"""version\s*=\s*["']{_semver}{_pre}{_local}["']"""
     with open(_version_path) as f:
-        match = re.search(_version_pattern, f.read().strip())
+        content = f.read().strip()
+        match = re.search(_version_pattern, content)
         if match is None:
+            print("FAILED")
             raise ValueError(f"invalid version at {_version_path}")
         return match.groupdict()
 
 
 def _get_package_version() -> str:
     parts = _get_plugin_version_dict()
-    return f'{parts["major"]}.{parts["minor"]}.{parts["patch"]}'
+    version = f'{parts["major"]}.{parts["minor"]}.{parts["patch"]}'
+    if parts["prekind"]:
+        version += f'{parts["prekind"]}'
+        if parts["pre"]:
+            version += f'{parts["pre"]}'
+    if parts["local"]:
+        version += f'+{parts["local"]}'
+    return version
 
 
 dbt_version = "1.7"

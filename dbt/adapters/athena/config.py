@@ -12,6 +12,7 @@ from dbt.adapters.athena.constants import (
     DEFAULT_SPARK_EXECUTOR_DPU_SIZE,
     DEFAULT_SPARK_MAX_CONCURRENT_DPUS,
     DEFAULT_SPARK_PROPERTIES,
+    ENFORCE_SPARK_PROPERTIES,
     EMR_SERVERLESS_SPARK_PROPERTIES,
     LAMBDA_SPARK_PROPERTIES,
     LOGGER,
@@ -148,6 +149,10 @@ class AthenaSparkSessionConfig(SparkSessionConfig):
             provided_spark_properties = self.try_parse_json(provided_spark_properties)
             if provided_spark_properties:
                 default_spark_properties.update(provided_spark_properties)
+                # Enforce certain properties
+                for key in ENFORCE_SPARK_PROPERTIES:
+                    if key in default_spark_properties:
+                        default_spark_properties[key] = ENFORCE_SPARK_PROPERTIES[key]
                 default_engine_config["SparkProperties"] = default_spark_properties
                 engine_config.pop("SparkProperties", None)
             default_engine_config.update(engine_config)
@@ -280,6 +285,10 @@ class EmrServerlessSparkSessionConfig(SparkSessionConfig):
                 final_jars = ", ".join(jar_updated_list)
                 provided_spark_properties["spark.jars"] = final_jars
             default_spark_properties.update(provided_spark_properties)
+            # Enforce certain properties
+            for key in ENFORCE_SPARK_PROPERTIES:
+                if key in default_spark_properties:
+                    default_spark_properties[key] = ENFORCE_SPARK_PROPERTIES[key]
         return default_spark_properties
 
 
@@ -366,4 +375,8 @@ class LambdaSparkSessionConfig(SparkSessionConfig):
                 final_jar_pckgs = ", ".join(jar_pckgs_updated_list)
                 provided_spark_properties["spark.jars.packages"] = final_jar_pckgs
             default_spark_properties.update(provided_spark_properties)
+            # Enforce certain properties
+            for key in ENFORCE_SPARK_PROPERTIES:
+                if key in default_spark_properties:
+                    default_spark_properties[key] = ENFORCE_SPARK_PROPERTIES[key]
         return default_spark_properties

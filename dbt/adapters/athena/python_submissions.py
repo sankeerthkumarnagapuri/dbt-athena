@@ -143,6 +143,7 @@ class AthenaPythonJobHelper(PythonJobHelper):
                     calculation_execution_id = self.athena_client.start_calculation_execution(
                         SessionId=self.session_id, CodeBlock=compiled_code.lstrip()
                     )["CalculationExecutionId"]
+                    LOGGER.debug(f"Started execution with calculation Id: {calculation_execution_id}")
                     break
                 except botocore.exceptions.ClientError as ce:
                     if (
@@ -549,8 +550,12 @@ script location:        {script_location}
 error message:          {e}
 """
                 )
+
             job_run_id = response.get("jobRunId")
             LOGGER.debug(f"Job: {job_run_id} started for model: {self.relation_name}")
+            LOGGER.debug(
+                f"Job driver log: s3://{self.s3_bucket}/{self.s3_log_prefix}/applications/{self.application_id}/jobs/{job_run_id}/SPARK_DRIVER/stdout.gz"
+            )
 
             job_done = False
             while wait and not job_done:
@@ -571,6 +576,7 @@ emr application id:     {self.application_id}
 emr job run Id:         {job_run_id}
 script location:        {script_location}
 error message:          {err}
+driver log:             s3://{self.s3_bucket}/{self.s3_log_prefix}/applications/{self.application_id}/jobs/{job_run_id}/SPARK_DRIVER/stdout.gz
 """
                     )
                 elif jr_response.get("state") in ["CANCELLING", "CANCELLED"]:
@@ -581,6 +587,7 @@ dbt model:              {self.relation_name}
 emr application id:     {self.application_id}
 emr job run Id:         {job_run_id}
 script location:        {script_location}
+driver log:             s3://{self.s3_bucket}/{self.s3_log_prefix}/applications/{self.application_id}/jobs/{job_run_id}/SPARK_DRIVER/stdout.gz
 """
                     )
                 elif jr_response.get("state") == "SUCCESS":
@@ -602,6 +609,7 @@ dbt model:              {self.relation_name}
 emr application id:     {self.application_id}
 emr job Id:             {job_run_id}
 error message:          {e}
+driver log:             s3://{self.s3_bucket}/{self.s3_log_prefix}/applications/{self.application_id}/jobs/{job_run_id}/SPARK_DRIVER/stdout.gz
 """
             )
         return response.get("jobRun")
@@ -809,7 +817,7 @@ class LambdaJobHelper(PythonJobHelper):
             if not success:
                 raise DbtRuntimeError(f"Error in Lambda execution. {run_detail}")
             else:
-                LOGGER.debug(f"Lambda run complete for model: {self.relation_name}")
+                LOGGER.debug(f"Lambda run complete. {run_detail}")
                 return run_detail
         else:
             return {"ignore": "empty compiled script"}
