@@ -29,15 +29,17 @@
   {% set to_drop = [] %}
   {% set build_sql = "" %}
   {% set build_py = "" %}
+  {%- set post_handle_append_io = false -%}
+  {%- set post_handle_append = false -%}
+  {%- set post_handle_merge = false -%}
+
   {% if existing_relation is none %}
     {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch) -%}
     {% set build_py = query_result -%}
-    {% set build_sql = "select '" ~ query_result ~ "'" -%}
   {% elif existing_relation.is_view or should_full_refresh() %}
     {% do drop_relation(existing_relation) %}
     {% set query_result = safe_create_table_as(False, target_relation, compiled_code, model_language, force_batch) -%}
     {% set build_py = query_result -%}
-    {% set build_sql = "select '" ~ query_result ~ "'" -%}
   {% elif partitioned_by is not none and strategy == 'insert_overwrite' %}
     {% if old_tmp_relation is not none %}
       {% do drop_relation(old_tmp_relation) %}
@@ -55,11 +57,7 @@
             {%- endset -%}
         {%- endif -%}
     {% else %}
-      {% do delete_overlapping_partitions(target_relation, tmp_relation, partitioned_by) %}
-      {% set build_sql = incremental_insert(
-          on_schema_change, tmp_relation, target_relation, existing_relation, force_batch
-        )
-      %}
+      {%- set post_handle_append_io = true -%}
     {% endif %}
     {% do to_drop.append(tmp_relation) %}
   {% elif strategy == 'append' %}
@@ -68,10 +66,7 @@
     {% endif %}
     {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch) -%}
     {% set build_py = query_result -%}
-    {% set build_sql = incremental_insert(
-        on_schema_change, tmp_relation, target_relation, existing_relation, force_batch
-      )
-    %}
+    {%- set post_handle_append = true -%}
     {% do to_drop.append(tmp_relation) %}
   {% elif strategy == 'merge' and table_type == 'iceberg' %}
     {% set unique_key = config.get('unique_key') %}
@@ -98,6 +93,37 @@
     {% endif %}
     {% set query_result = safe_create_table_as(True, tmp_relation, compiled_code, model_language, force_batch) -%}
     {% set build_py = query_result -%}
+    {%- set post_handle_merge = true -%}
+    {% do to_drop.append(tmp_relation) %}
+  {% endif %}
+
+  {%- call statement("main", language=model_language) -%}
+    {%- if model_language == 'sql' -%}
+      SELECT '{{ query_result }}';
+    {%- else -%}
+      {{- build_py -}}
+    {%- endif -%}
+  {%- endcall -%}
+
+  {% if post_handle_append_io %}   
+    -- run incremental insert overwrite append sql
+      {% do delete_overlapping_partitions(target_relation, tmp_relation, partitioned_by) %}
+      {% set build_sql = incremental_insert(
+          on_schema_change, tmp_relation, target_relation, existing_relation, force_batch
+        )
+      %}
+  {% endif %}
+
+  {% if post_handle_append %}   
+    -- run incremental append sql
+    {% set build_sql = incremental_insert(
+        on_schema_change, tmp_relation, target_relation, existing_relation, force_batch
+      )
+    %}
+  {% endif %}
+
+  {% if post_handle_merge %}   
+    -- run incremental merge sql
     {% set build_sql = iceberg_merge(
         on_schema_change=on_schema_change,
         tmp_relation=tmp_relation,
@@ -111,16 +137,7 @@
         force_batch=force_batch,
       )
     %}
-    {% do to_drop.append(tmp_relation) %}
   {% endif %}
-
-  {%- call statement("main", language=model_language) -%}
-    {%- if model_language == 'sql' -%}
-      {{ build_sql }}
-    {%- else -%}
-      {{- build_py -}}
-    {%- endif -%}
-  {%- endcall -%}
 
   -- set table properties
   {% if not to_drop and table_type != 'iceberg' and model_language != 'python' %}

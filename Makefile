@@ -57,5 +57,6 @@ ca-upload:
 	twine upload --repository-url https://mtx-955578949754.d.codeartifact.us-east-1.amazonaws.com/pypi/mdata/ --verbose --username aws --password $(AUTH_TOKEN) dist/*
 
 ca-pip-extra:
+	export PIP_EXTRA_INDEX_URL=https://pypi.org/simple/
 	export PIP_EXTRA_INDEX_URL=https://aws:$(aws codeartifact get-authorization-token --domain mtx --domain-owner 955578949754 --region us-east-1 --query authorizationToken --output text)@mtx-955578949754.d.codeartifact.us-east-1.amazonaws.com/pypi/mdata/simple/
 	

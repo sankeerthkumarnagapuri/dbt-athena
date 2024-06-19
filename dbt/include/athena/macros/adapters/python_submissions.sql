@@ -14,9 +14,12 @@
     {%- set table_type = optional_args.get("table_type", "") -%}
     {%- set spark_properties = optional_args.get("spark_properties", "") -%}
 
+{{-"\n"-}}
 import pyspark
 
 {% if submission_method == "lambda" -%}
+
+{{-"\n"-}}
 spark = pyspark.sql.SparkSession.builder \
     .appName("dbt_{{ target_relation.schema}}_{{ target_relation.identifier }}") \
     .master("local[*]") \
@@ -24,13 +27,19 @@ spark = pyspark.sql.SparkSession.builder \
     .config("spark.sql.catalog.AwsDataCatalog.warehouse", "{{ location | replace('s3://', 's3a://') }}") \
     {%- endif %}
     .enableHiveSupport().getOrCreate()
+
 {%- endif -%}
 
 {% if submission_method == "emr_serverless" -%}
+
+{{-"\n"-}}
 spark = pyspark.sql.SparkSession.builder.appName("dbt_{{ target_relation.schema}}_{{ target_relation.identifier }}").enableHiveSupport().getOrCreate()
+
 {%- endif -%}
 
-{{- compiled_code -}}
+{{-"\n"-}}
+{{ compiled_code }}
+
 def materialize(spark_session, df, target_relation):
     import pandas
     if isinstance(df, pyspark.sql.dataframe.DataFrame):
@@ -77,7 +86,7 @@ materialize(spark, df, dbt.this)
 {%- endmacro -%}
 
 {%- macro athena__py_execute_query(query) -%}
-
+{{-"\n"-}}
 def execute_query(spark_session):
     spark_session.sql("""
     {{ query }}
@@ -88,6 +97,7 @@ execute_query(spark)
 {%- endmacro -%}
 
 {%- macro athena__py_get_spark_dbt_object() -%}
+{{-"\n"-}}
 def get_spark_df(identifier):
     """
     Override the arguments to ref and source dynamically
