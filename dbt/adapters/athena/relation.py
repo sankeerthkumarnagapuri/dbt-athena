@@ -26,6 +26,13 @@ class AthenaIncludePolicy(Policy):
     identifier: bool = True
 
 
+@dataclass
+class AthenaHiveIncludePolicy(Policy):
+    database: bool = False
+    schema: bool = True
+    identifier: bool = True
+
+
 @dataclass(frozen=True, eq=False, repr=False)
 class AthenaRelation(BaseRelation):
     quote_character: str = '"'  # Presto quote character
@@ -42,10 +49,13 @@ class AthenaRelation(BaseRelation):
         - https://cwiki.apache.org/confluence/display/Hive/LanguageManual+DDL
         """
 
-        old_value = self.quote_character
+        old_quote_character = self.quote_character
         object.__setattr__(self, "quote_character", "`")  # Hive quote char
+        old_include_policy = self.include_policy
+        object.__setattr__(self, "include_policy", AthenaHiveIncludePolicy())
         rendered = self.render()
-        object.__setattr__(self, "quote_character", old_value)
+        object.__setattr__(self, "quote_character", old_quote_character)
+        object.__setattr__(self, "include_policy", old_include_policy)
         return str(rendered)
 
     def render_pure(self) -> str:
@@ -81,6 +91,7 @@ class AthenaSchemaSearchMap(Dict[InformationSchema, Dict[str, Set[Optional[str]]
 RELATION_TYPE_MAP = {
     "EXTERNAL_TABLE": TableType.TABLE,
     "EXTERNAL": TableType.TABLE,  # type returned by federated query tables
+    "GOVERNED": TableType.TABLE,
     "MANAGED_TABLE": TableType.TABLE,
     "VIRTUAL_VIEW": TableType.VIEW,
     "table": TableType.TABLE,
@@ -91,16 +102,20 @@ RELATION_TYPE_MAP = {
 
 
 def get_table_type(table: TableTypeDef) -> TableType:
-    _type = RELATION_TYPE_MAP.get(table.get("TableType"))
-    _specific_type = table.get("Parameters", {}).get("table_type", "")
+    table_full_name = ".".join(filter(None, [table.get("CatalogId"), table.get("DatabaseName"), table["Name"]]))
 
-    if _specific_type.lower() == "iceberg":
+    input_table_type = table.get("TableType")
+    if input_table_type and input_table_type not in RELATION_TYPE_MAP:
+        raise ValueError(f"Table type {table['TableType']} is not supported for table {table_full_name}")
+
+    if table.get("Parameters", {}).get("table_type", "").lower() == "iceberg":
         _type = TableType.ICEBERG
+    elif not input_table_type:
+        raise ValueError(f"Table type cannot be None for table {table_full_name}")
+    else:
+        _type = RELATION_TYPE_MAP[input_table_type]
 
-    if _type is None:
-        raise ValueError("Table type cannot be None")
-
-    LOGGER.debug(f"table_name : {table.get('Name')}")
+    LOGGER.debug(f"table_name : {table_full_name}")
     LOGGER.debug(f"table type : {_type}")
 
     return _type

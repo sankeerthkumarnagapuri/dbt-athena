@@ -19,7 +19,6 @@ from botocore.exceptions import ClientError
 from dbt_common.clients.agate_helper import table_from_rows
 from dbt_common.contracts.constraints import ConstraintType
 from dbt_common.exceptions import DbtRuntimeError
-from mypy_boto3_athena import AthenaClient
 from mypy_boto3_athena.type_defs import DataCatalogTypeDef, GetWorkGroupOutputTypeDef
 from mypy_boto3_glue.type_defs import (
     ColumnTypeDef,
@@ -47,7 +46,6 @@ from dbt.adapters.athena.lakeformation import (
 )
 from dbt.adapters.athena.python_submissions import AthenaPythonJobHelper, EmrServerlessJobHelper, LambdaJobHelper
 from dbt.adapters.athena.relation import (
-    RELATION_TYPE_MAP,
     AthenaRelation,
     AthenaSchemaSearchMap,
     TableType,
@@ -99,6 +97,8 @@ class AthenaConfig(AdapterConfig):
         seed_s3_upload_args: Dictionary containing boto3 ExtraArgs when uploading to S3.
         partitions_limit: Maximum numbers of partitions when batching.
         force_batch: Skip creating the table as ctas and run the operation directly in batch insert mode.
+        unique_tmp_table_suffix: Enforce the use of a unique id as tmp table suffix instead of __dbt_tmp.
+        temp_schema: Define in which schema to create temporary tables used in incremental runs.
     """
 
     work_group: Optional[str] = None
@@ -119,6 +119,8 @@ class AthenaConfig(AdapterConfig):
     seed_s3_upload_args: Optional[Dict[str, Any]] = None
     partitions_limit: Optional[int] = None
     force_batch: bool = False
+    unique_tmp_table_suffix: bool = False
+    temp_schema: Optional[str] = None
 
 
 class AthenaAdapter(SQLAdapter):
@@ -215,14 +217,11 @@ class AthenaAdapter(SQLAdapter):
             lf_permissions.process_permissions(lf_config)
 
     @lru_cache()
-    def _get_work_group(self, client: AthenaClient, work_group: str) -> GetWorkGroupOutputTypeDef:
+    def _get_work_group(self, work_group: str) -> GetWorkGroupOutputTypeDef:
         """
         helper function to cache the result of the get_work_group to avoid APIs throttling
         """
-        return client.get_work_group(WorkGroup=work_group)
-
-    @available
-    def is_work_group_output_location_enforced(self) -> bool:
+        LOGGER.debug("get_work_group for %s", work_group)
         conn = self.connections.get_thread_connection()
         creds = conn.credentials
         client = conn.handle
@@ -234,8 +233,15 @@ class AthenaAdapter(SQLAdapter):
                 config=get_boto3_config(num_retries=creds.effective_num_retries),
             )
 
+        return athena_client.get_work_group(WorkGroup=work_group)
+
+    @available
+    def is_work_group_output_location_enforced(self) -> bool:
+        conn = self.connections.get_thread_connection()
+        creds = conn.credentials
+
         if creds.work_group:
-            work_group = self._get_work_group(athena_client, creds.work_group)
+            work_group = self._get_work_group(creds.work_group)
             output_location = (
                 work_group.get("WorkGroup", {})
                 .get("Configuration", {})
@@ -419,6 +425,10 @@ class AthenaAdapter(SQLAdapter):
         if table_location := self.get_glue_table_location(relation):
             self.delete_from_s3(table_location)
 
+    @available
+    def generate_unique_temporary_table_suffix(self, suffix_initial: str = "__dbt_tmp") -> str:
+        return f"{suffix_initial}_{str(uuid4())}"
+
     def quote(self, identifier: str) -> str:
         return f"{self.quote_character}{identifier}{self.quote_character}"
 
@@ -536,12 +546,13 @@ class AthenaAdapter(SQLAdapter):
         response = s3_client.list_objects_v2(Bucket=s3_bucket, Prefix=s3_prefix)
         return True if "Contents" in response else False
 
-    def _get_one_table_for_catalog(self, table: TableTypeDef, database: str) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _get_one_table_for_catalog(table: TableTypeDef, database: str) -> List[Dict[str, Any]]:
         table_catalog = {
             "table_database": database,
             "table_schema": table["DatabaseName"],
             "table_name": table["Name"],
-            "table_type": RELATION_TYPE_MAP[table.get("TableType", "EXTERNAL_TABLE")].value,
+            "table_type": get_table_type(table).value,
             "table_comment": table.get("Parameters", {}).get("comment", table.get("Description", "")),
         }
         return [
@@ -557,14 +568,13 @@ class AthenaAdapter(SQLAdapter):
             for idx, col in enumerate(table["StorageDescriptor"]["Columns"] + table.get("PartitionKeys", []))
         ]
 
-    def _get_one_table_for_non_glue_catalog(
-        self, table: TableTypeDef, schema: str, database: str
-    ) -> List[Dict[str, Any]]:
+    @staticmethod
+    def _get_one_table_for_non_glue_catalog(table: TableTypeDef, schema: str, database: str) -> List[Dict[str, Any]]:
         table_catalog = {
             "table_database": database,
             "table_schema": schema,
             "table_name": table["Name"],
-            "table_type": RELATION_TYPE_MAP[table.get("TableType", "EXTERNAL_TABLE")].value,
+            "table_type": get_table_type(table).value,
             "table_comment": table.get("Parameters", {}).get("comment", ""),
         }
         return [
@@ -577,6 +587,7 @@ class AthenaAdapter(SQLAdapter):
                     "column_comment": col.get("Comment", ""),
                 },
             }
+            # TODO: review this code part as TableTypeDef class does not contain "Columns" attribute
             for idx, col in enumerate(table["Columns"] + table.get("PartitionKeys", []))
         ]
 
